@@ -1,0 +1,76 @@
+<?php
+
+namespace App\Models\DBModel\Traits;
+
+use Illuminate\Support\Facades\DB;
+use RuntimeException;
+
+trait JoinableTrait
+{
+    protected array $joins = [];
+
+    /**
+     * Add a join to another model
+     *
+     * @param string $childModelClass Full class name of child model
+     * @param string $localKey Column in this model
+     * @param string $foreignKey Column in child model
+     * @param string $type Join type: INNER, LEFT, RIGHT (default: INNER)
+     * @return $this
+     */
+    public function joinModel(string $childModelClass, string $localKey, string $foreignKey, string $type = 'INNER'): self
+    {
+        if (!class_exists($childModelClass)) {
+            throw new RuntimeException("Model class {$childModelClass} does not exist.");
+        }
+
+        $childModel = new $childModelClass();
+
+        $this->joins[] = [
+            'table' => "{$childModel->schema}.{$childModel->table}",
+            'connection' => $childModel->connection,
+            'localKey' => $localKey,
+            'foreignKey' => $foreignKey,
+            'type' => strtoupper($type),
+            'model' => $childModel
+        ];
+
+        return $this;
+    }
+
+    /**
+     * Build the query with joins applied
+     *
+     * @return \Illuminate\Database\Query\Builder
+     */
+    protected function buildJoinQuery()
+    {
+        $query = $this->query();
+
+        foreach ($this->joins as $join) {
+            $joinTable = $join['table'];
+            $joinType = $join['type'];
+            $localKey = $join['localKey'];
+            $foreignKey = $join['foreignKey'];
+
+            // Use correct connection for the join
+            $query->join(
+                DB::connection($join['connection'])->raw($joinTable),
+                "{$this->table}.{$localKey}",
+                '=',
+                "{$join['table']}.{$foreignKey}",
+                $joinType
+            );
+        }
+
+        return $query;
+    }
+
+    /**
+     * Clear joins after query
+     */
+    protected function clearJoins()
+    {
+        $this->joins = [];
+    }
+}
