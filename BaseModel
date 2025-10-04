@@ -1,0 +1,665 @@
+<?php 
+
+namespace App\Models\DBModel;
+
+use App\Models\DBModel\Traits\JoinableTrait;
+use Exception;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
+use RuntimeException;
+
+/**
+ * Class DBModelV1
+ *
+ * Custom base model for raw SQL operations with security,
+ * performance, and reusability in mind.
+ *
+ * --------------------------
+ * Security Features:
+ * --------------------------
+ * - Parameter binding in raw queries → prevents SQL injection.
+ * - Queries wrapped in try/catch with error logging.
+ * - Soft delete supported → prevents data loss.
+ * - Mass assignment protection via $fillable.
+ *
+ * --------------------------
+ * Performance Features:
+ * --------------------------
+ * - Cursor and chunk queries → memory safe for massive datasets.
+ * - Centralized DB connection → consistent + reusable.
+ */
+abstract class DBModelV1
+{   
+    use JoinableTrait;
+
+    protected $dbConnection;
+    protected string $schema;
+    protected string $table;
+    protected string $connection;
+
+    protected string $fullTableName;
+    protected string $primaryKey = 'id';
+    protected array $fillable = [];
+    protected bool $softDelete = true;
+    protected bool $timestamps = true;
+    protected array $casts = [];
+
+    protected int $chunkThreshold = 1000;
+
+
+    /**
+     * Constructor to initialize DB connection.
+     */
+    public function __construct()
+    {   
+        $this->validateRequiredVars();
+        $this->initializeConnection();
+    }
+
+    /**
+     * Make sure child declares connection, table and database
+     */
+    protected function validateRequiredVars()
+    {
+        $required = ['connection', 'table', 'schema'];
+
+        foreach($required as $var){
+            if (! property_exists($this, $var)) {
+                throw new RuntimeException(static::class . " must declare \${$var}");
+            }   
+
+            if(empty($this->{$var})){
+                throw new RuntimeException(static::class . " must set a non-empty value for \${var}");
+            }
+        }
+    }
+
+    /**
+     * Initialize DB Connection safely
+     */
+   protected function initializeConnection()
+    {
+        // Grab base connection config
+        $config = config("database.connections.{$this->connection}");
+
+        if (!$config) {
+            throw new RuntimeException("Connection [{$this->connection}] not found in config.");
+        }
+
+        if (empty($this->schema)) {
+            throw new RuntimeException("No database set for model " . static::class);
+        }
+
+        switch ($config['driver']) {
+            case 'mysql':
+            // MySQL → override database
+            $config['database'] = $this->schema;
+            $runtimeConnection = $this->connection;
+            $this->fullTableName = $this->table;
+            break;
+
+        case 'oracle':
+            // Oracle → use existing credentials in .env
+            $runtimeConnection = $this->connection;
+
+            // Fully qualified table name SCHEMA.TABLE
+            $this->fullTableName = strtoupper($this->schema) . '.' . strtoupper($this->table);
+            break;
+
+        default:
+            throw new RuntimeException("Unsupported driver: {$config['driver']}");
+        }
+
+       // Register runtime connection
+        config(["database.connections.{$runtimeConnection}" => $config]);
+        if (!$config) {
+            throw new RuntimeException("Connection [{$this->connection}] not found in config.");
+        }
+       try {
+            // For MySQL: database is the schema
+            if ($config['driver'] === 'mysql') {
+                $config['database'] = $this->schema;
+            }
+
+            // Register a runtime connection to avoid overwriting
+            config(["database.connections.runtime_{$this->connection}" => $config]);
+
+            // Bind the connection
+            $this->dbConnection = DB::connection("runtime_{$this->connection}");
+            $this->dbConnection->getPdo(); // Test connection
+
+            // Fully qualified table for Oracle, normal table for MySQL
+            if ($config['driver'] === 'oracle') {
+                $this->fullTableName = strtoupper($this->schema) . '.' . strtoupper($this->table);
+            } else {
+                $this->fullTableName = $this->table;
+            }
+
+            Log::info('DBModelV1 Connection initialized', [
+                'driver' => $this->dbConnection->getDriverName(),
+                'table' => $this->fullTableName,
+            ]);
+        } catch (Exception $e) {
+            Log::error("Failed to initialize DB connection: " . $e->getMessage());
+            throw new RuntimeException("Unable to connect to database [{$this->connection}].", 0, $e);
+        }
+    }
+
+
+    /**
+     * Protected helper for child to build custom queries 
+     * 
+     *@return \Illuminate\Database\Query\Builder
+     * 
+     * @example
+     */    
+    protected function query()
+    {
+        try {
+            if ($this->dbConnection->getDriverName() === 'oracle') {
+                // Use raw table name to prevent quoting
+                return $this->dbConnection->table(DB::raw($this->fullTableName));
+            }
+            // MySQL or other drivers
+            return $this->dbConnection->table($this->fullTableName ?? $this->table);
+        } catch (\Exception $e) {
+            Log::error("Failed to build query for table {$this->fullTableName}: " . $e->getMessage());
+            throw new RuntimeException("Unable to build query for table {$this->fullTableName}");
+        }
+    }
+    
+    
+    // -----------------------------------------------------------------------
+    // Utility Helpers
+    // -----------------------------------------------------------------------
+    
+    /**
+     * Filter data based on $fillable to prevent mass assignment.
+     */
+    protected function filterData(array $data): array
+    {
+        if(empty($this->fillable)) return $data;
+            
+        return array_filter(
+            $data,
+            fn($key) => in_array($key, $this->fillable),
+            ARRAY_FILTER_USE_KEY
+        );
+    }
+    
+    public function attributes()
+    {
+
+        $attributes = Arr::pluck(DB::connection($this->connection)->select('DESCRIBE ' . $this->table), 'Field');
+        return $attributes;
+        
+    }
+
+    /**
+     * Cast a single value based on $casts definition.
+     */
+    protected function castValue(string $key, $value)
+    {
+        if (!isset($this->casts[$key]) || $value === null) {
+            return $value;
+        }
+        
+        return match ($this->casts[$key]) {
+            'int', 'integer' => (int) $value,
+            'real', 'float', 'double' => (float) $value,
+            'string' => (string) $value,
+            'bool', 'boolean' => (bool) $value,
+            'array' => json_decode($value, true),
+            'object' => json_decode($value),
+            'datetime' => \Carbon\Carbon::parse($value),
+            default => $value,
+        };
+    }
+
+    /**
+     * Apply casts to an entire row.
+     */
+    protected function applyCasts(array $row): array
+    {
+        foreach ($row as $key => $value) {
+            $row[$key] = $this->castValue($key, $value);
+        }
+        return $row;
+    }
+
+    /**
+     * Memory-safe generator for large queries using cursor-like batching.
+     *
+     * @param \Illuminate\Database\Query\Builder $query
+     * @param int $batchSize
+     * @return \Generator
+     */
+    protected function lazyQuery($query, int $chunkSize = 1000): \Generator
+        {
+            $lastId = null;
+
+            do {
+                $batch = clone $query;
+
+                if ($lastId !== null) {
+                    $batch->where($this->primaryKey, '>', $lastId);
+                }
+
+                $rows = $batch->orderBy($this->primaryKey)
+                            ->limit($chunkSize)
+                            ->get();
+
+                if ($rows->isEmpty()) {
+                    break;
+                }
+
+                foreach ($rows as $row) {
+                    yield $this->applyCasts((array) $row);
+                    $lastId = $row->{$this->primaryKey};
+                }
+
+            } while ($rows->count() === $chunkSize);
+        }
+
+    // -----------------------------------------------------------------------
+    // CORE Queries
+    // -----------------------------------------------------------------------
+    /**
+     * Get all rows with memory-safe lazy generator and auto-chunking.
+     * 
+     * If row count exceeds $chunkThreshold, results will be chunked
+     * automatically to avoid memory overload.
+     * 
+     
+     */
+    public function all(?int $chunkThreshold = null)
+    {
+    
+        try {
+            $threshold = $chunkThreshold ?? $this->chunkThreshold;
+            $query = $this->query();
+            // if ($this->softDelete) $query->whereNull('deleted_at');
+
+            // Log the SQL for debugging
+            Log::info('DBModelV1 Query Debug', [
+                'table' => $this->fullTableName,
+                'sql'   => $query->toSql(),
+            ]);
+            
+            return $this->lazyQuery($query, $threshold);
+        } catch (Exception $e) {
+            Log::error("[DBModelV1] Failed all() on {$this->table}: " . $e->getMessage());
+            throw new RuntimeException("Failed to fetch all records.");
+            
+            return response()->json([
+                'error' => 'Failed to fetch records',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+
+    /**
+     * Find a row by primary key.
+     * 
+     * @param mixed $id
+     * @return object|null
+     */
+    public function find($id): ?array
+    {
+        try {
+            $sql = "SELECT * FROM {$this->schema}.{$this->table} WHERE {$this->primaryKey} = :id";
+            if ($this->softDelete) {
+                $sql .= " AND deleted_at IS NULL";
+            }
+            $result = $this->dbConnection->select($sql, ['id' => $id]);
+            return $result ? $this->applyCasts((array) $result[0]) : null;
+        } catch (Exception $e) {
+            Log::error("[DBModelV1] Failed find() on {$this->table}: " . $e->getMessage());
+            throw new RuntimeException("Failed to fetch record by ID.");
+        }
+    }
+
+    /**
+     * Insert a new row.
+     * 
+     * @param array $data
+     * @return int Inserted ID 
+     */
+    public function create(array $data): int
+    {
+        $data = $this->filterData($data);
+
+        try {
+            $lastInsertId = 0;
+            $this->dbConnection->transaction(function () use (&$data, &$lastInsertId) {
+                if ($this->timestamps) {
+                    $data['created_at'] = now();
+                    $data['updated_at'] = now();
+                }
+
+                $cols = implode(", ", array_keys($data));
+                $placeholders = implode(", ", array_map(fn($k) => ":$k", array_keys($data)));
+
+                $sql = "INSERT INTO {$this->schema}.{$this->table} ($cols) VALUES ($placeholders)";
+                $this->dbConnection->insert($sql, $data);
+            
+                $lastInsertId = $this->dbConnection->getPdo()->lastInsertId();
+
+            });
+             // 🔹 Audit Log: record creation
+            $this->auditLog('create', null, $data + ['id' => $lastInsertId]);
+
+            return $lastInsertId;
+        } catch (Exception $e) {
+            Log::error("[DBModelV1] Failed create() on {$this->table}: " . $e->getMessage());
+            throw new RuntimeException("Failed to create record.");
+        }
+    }
+
+    /**
+     * Insert a new row and return the created record.
+     * 
+     * @param array $data
+     * @return array|null
+     */
+    public function createAndReturn(array $data): ?array
+    {
+        $id = $this->create($data);
+        return $this->find($id);
+    }
+
+    /**
+     * Insert multiple rows in a single transaction.
+     * 
+     * @param array $dataArray
+     * @return int Number of inserted rows
+     */
+    public function insertMany(array $rows): bool
+    {
+        try {
+            return $this->dbConnection->table("{$this->schema}.{$this->table}")->insert($rows);
+        } catch (Exception $e) {
+            Log::error("[DBModelV1] Failed insertMany() on {$this->table}: " . $e->getMessage());
+            throw new RuntimeException("Bulk insert failed.");
+        }
+    }
+
+    /**
+     * Update a row by primary key.
+     * 
+     * @param mixed $id
+     * @param array $data
+     * @return int Affected rows
+     */
+    public function update($id, array $data): bool
+    {
+         try {
+            return $this->dbConnection->transaction(function () use ($id, $data) {
+                $oldRecord = $this->find($id);
+
+                if ($this->timestamps) {
+                    $data['updated_at'] = now();
+                }
+
+                $set = implode(", ", array_map(fn($k) => "$k = :$k", array_keys($data)));
+                $sql = "UPDATE {$this->schema}.{$this->table} SET $set WHERE id = :id";
+
+                $data['id'] = $id;
+                $updated = $this->dbConnection->update($sql, $data);
+
+                if ($updated) {
+                    // Audit Log: record update
+                    $this->auditLog('update', $oldRecord, $data);
+                }
+
+                return (bool) $updated;
+            });
+        } catch (Exception $e) {
+            Log::error("[DBModelV1] Failed update() on {$this->table}: " . $e->getMessage());
+            throw new RuntimeException("Failed to update record.");
+        }
+    }
+
+    /**
+     * Delete a row by primary key (soft delete if enabled).
+     * 
+     */
+    public function delete($id, ?bool $softDelete = null): bool
+    {
+        try { 
+
+            $oldRecord = $this->find($id);
+            $oldRecord = $oldRecord ? (array) $oldRecord : null;
+            
+            $soft = $softDelete ?? $this->softDelete;
+
+            if(!$oldRecord || !empty($oldRecord['deleted_at'])) return false;
+
+            $this->dbConnection->transaction(function () use ($id, $soft) {
+                $sql = $soft
+                    ? "UPDATE {$this->schema}.{$this->table} SET deleted_at = NOW() WHERE {$this->primaryKey} = :id"
+                    : "DELETE FROM {$this->schema}.{$this->table} WHERE {$this->primaryKey} = :id";
+
+                $soft
+                    ? $this->dbConnection->update($sql, ['id' => $id]) 
+                    : $this->dbConnection->delete($sql, ['id' => $id]);
+            });
+
+            $this->auditLog($soft ? 'soft_delete' : 'hard_delete', $oldRecord);
+
+            return true;
+
+        } catch (Exception $e) {
+            Log::error("[DBModelV1] Failed delete() on {$this->table}: " . $e->getMessage());
+            throw new RuntimeException("Failed to delete record.");
+        }
+    }
+
+    /**
+     * Restore a soft-deleted row by primary key.
+     * 
+     */
+    public function restore($id): bool
+    {
+
+        try {
+            /** @var array|null $oldRecord */
+            $oldRecord = $this->find($id);
+            $oldRecord = $oldRecord ? (array) $oldRecord : null;
+
+            if (!$oldRecord || empty($oldRecord['deleted_at'])) {
+                throw new RuntimeException(
+                    !$oldRecord 
+                        ? "Record with ID {$id} not found." 
+                        : "Record with ID {$id} is not soft deleted."
+                );
+            }
+
+            $sql = "UPDATE {$this->database}.{$this->table} SET deleted_at = NULL WHERE {$this->primaryKey} = :id";
+            $this->dbConnection->update($sql, ['id' => $id]);
+
+            // Audit log after restore
+            $this->auditLog('restore', $oldRecord);
+
+            return true;
+        } catch (Exception $e) {
+            Log::error("[DBModelV1] Failed restore() on {$this->table}: " . $e->getMessage());
+            throw new RuntimeException("Failed to restore record.");
+    }
+    }
+
+    /**
+     * WHERE query with memory-safe lazy generator and auto-chunking.
+     *
+     * @param array $conditions Key-value conditions for filtering
+     * @param int|null $chunkThreshold Optional override of class-level chunkThreshold
+     * @return \Illuminate\Support\Collection|\Generator
+     */
+    public function where(array $conditions, ?int $chunkThreshold = null)
+    {
+        try {
+            $threshold = $chunkThreshold ?? $this->chunkThreshold;
+            $query = $this->query();
+            foreach ($conditions as $col => $val) {
+                $query->where($col, $val);
+            }
+            if ($this->softDelete) $query->whereNull('deleted_at');
+            return $this->lazyQuery($query, $chunkThreshold);
+
+        } catch (Exception $e) {
+            Log::error("[DBModelV1] Failed where() on {$this->table}: " . $e->getMessage());
+            throw new \RuntimeException("Failed to execute where query.");
+        }
+    }
+
+
+    /**
+     * Process large datasets in memory-safe chunks with a generator.
+     *
+     * @param int|null $chunkSize Optional override of class-level chunkThreshold
+     * @return \Generator
+     */
+    public function chunk(?int $chunkSize = null): \Generator
+    {
+        try {
+            $threshold = $chunkSize ?? $this->chunkThreshold;
+            $query = $this->query();
+            if ($this->softDelete) $query->whereNull('deleted_at');
+            return $this->lazyQuery($query, $chunkSize);
+
+        } catch (Exception $e) {
+            Log::error("[DBModelV1] Failed chunk() on {$this->table}: " . $e->getMessage());
+            throw new \RuntimeException("Failed to process chunk.");
+        }
+    }
+
+   /**
+     * Lazy cursor-based pagination for large datasets.
+     *
+     * @param int $perPage
+     * @param mixed|null $lastId Optional last seen primary key for cursor
+     * @return \Generator
+     */
+    public function paginate(int $perPage = 1000, $lastId = null): \Generator
+    {
+        try {
+            $query = $this->query();
+            if ($this->softDelete) $query->whereNull('deleted_at');
+            return $this->lazyQuery($query, $perPage);
+        } catch (Exception $e) {
+            Log::error("[DBModelV1] Failed paginate() on {$this->table}: " . $e->getMessage());
+            throw new \RuntimeException("Failed lazy pagination.");
+        }
+    }
+
+
+    /**
+     * Count rows with optional conditions.
+     */
+    public function count(array $conditions = []): int
+    {
+        try {
+            $query = $this->dbConnection->table("{$this->schema}.{$this->table}");
+            foreach ($conditions as $col => $val) {
+                $query->where($col, $val);
+            }
+            if ($this->softDelete) {
+                $query->whereNull('deleted_at');
+            }
+            return $query->count();
+        } catch (Exception $e) {
+            Log::error("Failed count() on {$this->table}: " . $e->getMessage());
+            throw new RuntimeException("DBModelV1::count failed on {$this->table}", 0, $e);
+        }
+    }
+
+    /**
+     * Get the first record.
+     */
+    public function first(): ?array
+    {
+        try {
+            $query = $this->dbConnection->table("{$this->schema}.{$this->table}");
+            if ($this->softDelete) {
+                $query->whereNull('deleted_at');
+            }
+            $row = (array) $query->first();
+            return $row ? $this->applyCasts($row) : null;
+        } catch (Exception $e) {
+            Log::error("Failed first() on {$this->table}: " . $e->getMessage());
+            throw new RuntimeException("DBModelV1::first failed on {$this->table}", 0, $e);
+        }
+    }
+
+    /**
+     * Get the first record or throw exception if none.
+     */
+    public function firstOrFail(): array
+    {
+        $row = $this->first();
+        if (!$row) {
+            throw new RuntimeException("No records found in {$this->table}");   
+        }
+        return $row;
+    }
+
+    /**
+     * Check if any record exists with conditions.
+     */
+    public function exists(array $conditions): bool
+    {
+        try {
+            $query = $this->dbConnection->table("{$this->schema}.{$this->table}");
+            foreach ($conditions as $col => $val) {
+                $query->where($col, $val);
+            }
+            if ($this->softDelete) {
+                $query->whereNull('deleted_at');
+            }
+            return $query->exists();
+        } catch (Exception $e) {
+            Log::error("Failed exists() on {$this->table}: " . $e->getMessage());
+            throw new RuntimeException("DBModelV1::exists failed on {$this->table}", 0, $e);
+        }
+    }
+
+    /**
+     * Audit log helper.
+     *
+     * @param string $action CRUD action: create, update, delete, restore
+     * @param array $data Data related to the action
+     * @param mixed|null $actor User ID or system performing the action
+     */
+    protected function auditLog(string $action, ?array $oldRecord = null, ?array $newRecord = null): void
+    {
+        try {
+            $actor = auth()->id() ?? 'system';
+
+            $recordData = [
+                'connection'  => $this->connection,
+                'schema_name' => $this->schema,
+                'table_name'  => $this->table,
+                'action'      => $action,
+                'actor'       => $actor,
+                'primary_key' => [
+                    'id' => $newRecord['id'] ?? $oldRecord['id'] ?? null,
+                ],
+                'timestamp'   => now()->toISOString(),
+                'changes'     => [
+                    'before' => $oldRecord,
+                    'after'  => $newRecord,
+                ],
+            ];
+
+            DB::table('audit_logs')->insert([
+                'record_data' => json_encode($recordData, JSON_PRETTY_PRINT),
+                'created_at'  => now(),
+            ]);
+        } catch (Exception $e) {
+            Log::error('[DBModelV1][AuditLog] Failed: ' . $e->getMessage());
+            throw new RuntimeException("DBModelV1::audit log failed.");
+        }
+    }
+}
